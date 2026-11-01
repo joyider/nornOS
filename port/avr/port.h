@@ -14,6 +14,7 @@
  */
 
 #include <stdint.h>
+#include <stddef.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
@@ -31,11 +32,25 @@
     room for the task's own calls. */
 #define RTOS_PORT_MIN_STACK     96u
 
+/** Stack frame alignment required by the ABI; the AVR has none. */
+#define RTOS_PORT_STACK_ALIGN   1u
+
 /** Attribute making a function overridable by the application. */
 #define RTOS_PORT_WEAK          __attribute__((weak))
 
-/** Unit of rtos_port_getRunTimeCounter in microseconds: tick timer prescaler 64 at F_CPU. */
-#define RTOS_PORT_RUNTIME_UNIT_US   (64ul * 1000000ul / F_CPU)
+/** Data that keeps its value across a reset (not zeroed by the startup code). */
+#define RTOS_PORT_NOINIT        __attribute__((section(".noinit")))
+
+/** How rtos_port_reset restarts: 0 jumps to the reset vector of the application without
+    passing the bootloader, 1 lets the watchdog reset the chip (needs a bootloader that
+    disables the watchdog; the original Mega 2560 bootloader does not). */
+#ifndef RTOS_CFG_AVR_RESET_VIA_WDT
+# define RTOS_CFG_AVR_RESET_VIA_WDT 0
+#endif
+
+/** Frequency of rtos_port_getRunTimeCounter: the tick timer counts at F_CPU/64. 32 bits
+    wrap after 4.7 hours at 16 MHz; the kernel only uses differences. */
+#define RTOS_PORT_RUNTIME_HZ    (F_CPU / 64ul)
 
 /** Place a string literal in flash. Used for assertion messages. */
 #define RTOS_PORT_STR(s)        PSTR(s)
@@ -102,7 +117,8 @@
  * the call-clobbered registers, runs the body, lets the kernel switch task if the body
  * made a higher priority task ready, and returns with reti.
  */
-#define RTOS_ISR(vector)                                                        \
+#define RTOS_ISR(vector)        RTOS_ISR_(vector)
+#define RTOS_ISR_(vector)                                                       \
     void vector##_rtosBody(void) __attribute__((used, noinline));               \
     ISR(vector, ISR_NAKED)                                                      \
     {                                                                           \
@@ -127,6 +143,9 @@ typedef uint8_t *rtos_port_ctx_t;
 
 /** Saved interrupt state of a critical section. */
 typedef uint8_t rtos_port_cs_t;
+
+/** Run time count, see RTOS_PORT_RUNTIME_HZ. */
+typedef uint32_t rtos_port_runtime_t;
 
 
 /*
@@ -164,7 +183,16 @@ static inline void rtos_port_idleSleep(void)
     sleep_disable();
 }
 
+/** Tickless idle is not implemented on the AVR: sleep until the next interrupt, which
+    is at most one tick away. */
+static inline void rtos_port_idleSleepTicks(rtos_tick_t ticks)
+{
+    (void)ticks;
+    rtos_port_idleSleep();
+}
+
 /** Stop forever with interrupts off. simavr terminates the simulation on this pattern. */
+static inline void rtos_port_halt(void) __attribute__((noreturn));
 static inline void rtos_port_halt(void)
 {
     cli();
@@ -185,12 +213,24 @@ static inline void rtos_port_halt(void)
 void rtos_port_switchContext(void);
 
 /** Prepare an unused stack so that the first switch to it lands in \a entry. */
-rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, uint16_t stackSize, void (*entry)(void));
+rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, size_t stackSize, void (*entry)(void));
 
 /** Configure and start the tick timer. */
 void rtos_port_startTimer(void);
 
-/** Free running time in units of RTOS_PORT_RUNTIME_UNIT_US. Interrupts must be disabled. */
-uint32_t rtos_port_getRunTimeCounter(void);
+/** Free running time at RTOS_PORT_RUNTIME_HZ. Interrupts must be disabled. */
+rtos_port_runtime_t rtos_port_getRunTimeCounter(void);
+
+/** Reset the MCU through the watchdog. Never returns. */
+void rtos_port_reset(void) __attribute__((noreturn));
+
+/** RTOS_RESET_* cause of the last reset, from MCUSR captured at startup. */
+uint8_t rtos_port_getResetCause(void);
+
+/** Start the hardware watchdog in reset mode; timeoutMs is rounded up to 15 ms..8 s. */
+void rtos_port_wdtStart(uint32_t timeoutMs);
+
+/** Restart the watchdog timeout. */
+void rtos_port_wdtKick(void);
 
 #endif  /* RTOS_PORT_INCLUDED */

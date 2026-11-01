@@ -13,17 +13,17 @@
  * overwrites 19 per second (20 posts, 1 fetch).
  */
 
-#include <avr/io.h>
 #include "rtos.h"
 #include "uart.h"
 #include "board.h"
+#include "testresult.h"
 
 #define TASK_SENSOR     1u
 #define TASK_CONSUMER   2u
 #define TASK_REPORTER   3u
 
 #define APPL_IRQ_HZ     500ul
-#if !BOARD_TIMER2_HZ_IS_EXACT(APPL_IRQ_HZ)
+#if !BOARD_APP_TIMER_HZ_IS_EXACT(APPL_IRQ_HZ)
 # error APPL_IRQ_HZ is not an exact rate of timer 2
 #endif
 #define QUEUE_CAPACITY  8u
@@ -32,7 +32,11 @@
 # define TC02_STOP_AFTER_MS  3000ul
 #endif
 
-#define STACK_SIZE      192u
+#if RTOS_PORT_MIN_STACK > 192u
+# define STACK_SIZE      (2u * RTOS_PORT_MIN_STACK)
+#else
+# define STACK_SIZE      192u
+#endif
 
 static uint8_t _stackSensor[STACK_SIZE];
 static uint8_t _stackConsumer[STACK_SIZE];
@@ -58,7 +62,7 @@ static struct
 } _stats;
 
 
-RTOS_ISR(TIMER2_COMPA_vect)
+RTOS_ISR(BOARD_APP_TIMER_VECT)
 {
     const uint16_t seq = ++_stats.sent;
     if(!rtos_queueSendFromIsr(&_qSeq, &seq))
@@ -68,7 +72,7 @@ RTOS_ISR(TIMER2_COMPA_vect)
 
 static void startApplInterrupt(void)
 {
-    board_timer2StartCtc((uint8_t)BOARD_TIMER2_TOP(APPL_IRQ_HZ));
+    board_appTimerStart(APPL_IRQ_HZ);
 }
 
 
@@ -139,6 +143,38 @@ static void taskSensor(void *arg)
 }
 
 
+/** Expected after TC02_STOP_AFTER_MS: every sent item was received, dropped, is still
+    queued or is the one in flight; every deliberate stall produced exactly one gap; the queue filled up but never
+    beyond its capacity; the mailbox was overwritten. */
+static void finish(void)
+{
+    uint16_t sent, dropped, received, queued;
+    const uint32_t ms = TC02_STOP_AFTER_MS;
+
+    {
+        const rtos_port_cs_t cs = rtos_port_enterCritical();
+        sent = _stats.sent;
+        dropped = _stats.dropped;
+        received = _stats.received;
+        queued = rtos_queueCount(&_qSeq);
+        rtos_port_exitCritical(cs);
+    }
+    tc_expectNear("sent", sent, ms * APPL_IRQ_HZ / 1000);
+    /* One item may be in flight: taken out of the queue but not yet counted by the
+       consumer, or handed directly to it while it was blocked. */
+    tc_expectRange("sent - (received + dropped + queued)",
+                   (uint32_t)(sent - (received + dropped + queued)), 0, 1);
+    tc_expect("gaps == stalls", _stats.gaps == _stats.stalls);
+    tc_expectRange("stalls", _stats.stalls, 1, 0xFFFFul);
+    tc_expectRange("maxFill", _stats.maxQueueFill, QUEUE_CAPACITY - 1, QUEUE_CAPACITY);
+    tc_expectRange("mboxOverwrites", _stats.mboxOverwrites, 1, 0xFFFFul);
+    tc_expectRange("stackFree1", rtos_getStackFree(TASK_SENSOR), 32, STACK_SIZE);
+    tc_expectRange("stackFree2", rtos_getStackFree(TASK_CONSUMER), 32, STACK_SIZE);
+    tc_expectRange("stackFree3", rtos_getStackFree(TASK_REPORTER), 32, STACK_SIZE);
+    tc_finish("tc02");
+}
+
+
 static void taskReporter(void *arg)
 {
     (void)arg;
@@ -153,10 +189,12 @@ static void taskReporter(void *arg)
         gotTemp = rtos_mboxFetch(&_mbTemp, &temp, RTOS_NO_WAIT);
 
         rtos_mutexLock(&_mutexStats);
-        cli();
-        sent = _stats.sent;
-        dropped = _stats.dropped;
-        sei();
+        {
+            const rtos_port_cs_t cs = rtos_port_enterCritical();
+            sent = _stats.sent;
+            dropped = _stats.dropped;
+            rtos_port_exitCritical(cs);
+        }
         uart_putsP(PSTR("t="));          uart_putU32(rtos_getTick());
         uart_putsP(PSTR(" sent="));      uart_putU32(sent);
         uart_putsP(PSTR(" received=")); uart_putU32(_stats.received);
@@ -178,10 +216,7 @@ static void taskReporter(void *arg)
 
 #if TC02_STOP_AFTER_MS > 0
         if(rtos_getTick() >= RTOS_MS(TC02_STOP_AFTER_MS))
-        {
-            uart_putsP(PSTR("tc02: done\r\n"));
-            rtos_port_halt();
-        }
+            finish();
 #endif
     }
 }
@@ -189,7 +224,7 @@ static void taskReporter(void *arg)
 
 void rtos_assertFailed(const char *file, uint16_t line)
 {
-    cli();
+    (void)rtos_port_enterCritical();
     uart_putsP(PSTR("\r\nASSERTION FAILED: "));
     uart_putsP(file);
     uart_putsP(PSTR(", line "));

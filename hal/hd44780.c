@@ -3,7 +3,7 @@
  * Character LCD driver in 4 bit mode.
  */
 
-#include <util/delay.h>
+#include "delay.h"
 #include "hd44780.h"
 
 #define CMD_CLEAR           0x01u
@@ -15,9 +15,9 @@
 static void pulseEnable(const hd44780_t *pLcd)
 {
     gpio_write(&pLcd->e, true);
-    _delay_us(1);
+    hal_delayUs(1);
     gpio_write(&pLcd->e, false);
-    _delay_us(40);
+    hal_delayUs(40);
 }
 
 static void writeNibble(const hd44780_t *pLcd, uint8_t nibble)
@@ -55,13 +55,13 @@ void lcd_init(hd44780_t *pLcd, uint8_t cols, uint8_t rows)
     gpio_write(&pLcd->e, false);
 
     /* Power-on reset sequence from the data sheet, figure 24. */
-    _delay_ms(50);
+    hal_delayMs(50);
     writeNibble(pLcd, 0x03);
-    _delay_ms(5);
+    hal_delayMs(5);
     writeNibble(pLcd, 0x03);
-    _delay_ms(5);
+    hal_delayMs(5);
     writeNibble(pLcd, 0x03);
-    _delay_us(150);
+    hal_delayUs(150);
     writeNibble(pLcd, 0x02);        /* Now in 4 bit mode. */
 
     command(pLcd, CMD_FUNCTION_SET);
@@ -73,7 +73,7 @@ void lcd_init(hd44780_t *pLcd, uint8_t cols, uint8_t rows)
 void lcd_clear(const hd44780_t *pLcd)
 {
     command(pLcd, CMD_CLEAR);
-    _delay_ms(2);
+    hal_delayMs(2);
 }
 
 void lcd_setCursor(const hd44780_t *pLcd, uint8_t col, uint8_t row)
@@ -99,7 +99,7 @@ void lcd_puts(const hd44780_t *pLcd, const char *s)
 void lcd_putsP(const hd44780_t *pLcd, const char *s)
 {
     char c;
-    while((c = (char)pgm_read_byte(s++)) != '\0')
+    while((c = (char)hal_flashReadByte(s++)) != '\0')
         lcd_putc(pLcd, c);
 }
 

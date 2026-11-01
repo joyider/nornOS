@@ -38,10 +38,26 @@ void rtos_port_idleSleep(void)
 {
 }
 
+void rtos_port_idleSleepTicks(rtos_tick_t ticks)
+{
+    (void)ticks;
+}
+
 void rtos_port_halt(void)
 {
     fprintf(stderr, "rtos_port_halt: kernel halted\n");
     exit(2);
+}
+
+void rtos_port_reset(void)
+{
+    fprintf(stderr, "rtos_port_reset: kernel reset requested\n");
+    exit(3);
+}
+
+uint8_t rtos_port_getResetCause(void)
+{
+    return RTOS_RESET_POWER_ON;
 }
 
 int rtos_host_interruptsDisabled(void)
@@ -73,7 +89,7 @@ void rtos_port_switchContext(void)
     swapcontext(getCtx(pFrom), getCtx(pTo));
 }
 
-rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, uint16_t stackSize, void (*entry)(void))
+rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, size_t stackSize, void (*entry)(void))
 {
     ucontext_t * const pCtx = calloc(1, sizeof(ucontext_t));
 
@@ -101,12 +117,32 @@ void rtos_host_simulateIsr(void (*isrBody)(void))
     _irqDisabled = s;
 }
 
+/* Simulated hardware watchdog: counts simulated ticks since the last kick. */
+static uint32_t _wdtTimeout = 0;
+static uint32_t _wdtCounter = 0;
+
+void rtos_port_wdtStart(uint32_t timeoutMs)
+{
+    _wdtTimeout = (uint32_t)(timeoutMs * RTOS_CFG_TICK_HZ / 1000ul);
+    _wdtCounter = 0;
+}
+
+void rtos_port_wdtKick(void)
+{
+    _wdtCounter = 0;
+}
+
 void rtos_host_tick(void)
 {
+    if(_wdtTimeout != 0  &&  ++_wdtCounter > _wdtTimeout)
+    {
+        fprintf(stderr, "host watchdog expired\n");
+        rtos_port_reset();
+    }
     rtos_host_simulateIsr(rtos_tickFromIsr);
 }
 
-uint32_t rtos_port_getRunTimeCounter(void)
+rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
 {
     return rtos_tickCount;
 }

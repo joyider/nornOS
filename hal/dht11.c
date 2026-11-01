@@ -3,7 +3,7 @@
  * DHT11 single wire protocol, polling implementation.
  */
 
-#include <util/delay.h>
+#include "delay.h"
 #include "dht11.h"
 
 /** Pulse measurement step in microseconds. */
@@ -23,7 +23,7 @@ static uint8_t waitWhile(const gpio_pin_t *pPin, bool level)
 
     while(gpio_read(pPin) == level)
     {
-        _delay_us(STEP_US);
+        hal_delayUs(STEP_US);
         us = (uint8_t)(us + STEP_US);
         if(us >= MAX_PULSE_US)
             return 0xFFu;
@@ -44,7 +44,7 @@ dht11_status_t dht11_readResponse(const gpio_pin_t *pPin, dht11_reading_t *pRead
 
     /* Release the line; the sensor answers within 20-40 us with 80 us low, 80 us high. */
     gpio_input(pPin, true);
-    _delay_us(30);
+    hal_delayUs(30);
     if(waitWhile(pPin, true) == 0xFFu)
         return DHT11_ERR_NO_RESPONSE;
     if(waitWhile(pPin, false) == 0xFFu  ||  waitWhile(pPin, true) == 0xFFu)

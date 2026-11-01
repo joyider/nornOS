@@ -1,0 +1,14 @@
+# doxygen doc/Doxyfile  ->  doc/api/html/index.html
+PROJECT_NAME           = nornOS
+PROJECT_BRIEF          = "A small real time kernel for AVR and ESP32"
+OUTPUT_DIRECTORY       = doc/api
+INPUT                  = kernel/rtos.h kernel/rtos_types.h hal doc/design.md doc/porting.md README.md
+FILE_PATTERNS          = *.h *.md
+RECURSIVE              = NO
+USE_MDFILE_AS_MAINPAGE = README.md
+EXTRACT_ALL            = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = YES
+GENERATE_LATEX         = NO
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO

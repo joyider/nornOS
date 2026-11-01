@@ -48,6 +48,8 @@ static bool enqueue(rtos_queue_t *pQ, const void *pItem)
     if(++pQ->tail >= pQ->capacity)
         pQ->tail = 0;
     ++ pQ->count;
+    if(pQ->count > pQ->maxCount)
+        pQ->maxCount = pQ->count;
     return true;
 }
 
@@ -94,6 +96,8 @@ void rtos_queueInit(rtos_queue_t *pQ, uint8_t *storage, uint8_t itemSize, uint8_
     pQ->tail = 0;
     pQ->readers = 0;
     pQ->writers = 0;
+    pQ->maxCount = 0;
+    pQ->dropped = 0;
 }
 
 
@@ -110,8 +114,10 @@ bool rtos_queueSend(rtos_queue_t *pQ, const void *pItem, rtos_tick_t timeout)
         pCur->pXfer = (void *)pItem;
         pQ->writers |= pCur->bit;
         pCur->pWaiters = &pQ->writers;
-        ok = !rtos_kernel_blockCurrent(timeout);
+        ok = !rtos_kernel_blockOn(RTOS_WAIT_QUEUE_SEND, pQ, timeout);
     }
+    if(!ok  &&  pQ->dropped < 0xFFFFu)
+        ++ pQ->dropped;
     rtos_kernel_schedule();
     rtos_port_exitCritical(cs);
     return ok;
@@ -120,7 +126,10 @@ bool rtos_queueSend(rtos_queue_t *pQ, const void *pItem, rtos_tick_t timeout)
 
 bool rtos_queueSendFromIsr(rtos_queue_t *pQ, const void *pItem)
 {
-    return enqueue(pQ, pItem);
+    const bool ok = enqueue(pQ, pItem);
+    if(!ok  &&  pQ->dropped < 0xFFFFu)
+        ++ pQ->dropped;
+    return ok;
 }
 
 
@@ -137,7 +146,7 @@ bool rtos_queueReceive(rtos_queue_t *pQ, void *pItem, rtos_tick_t timeout)
         pCur->pXfer = pItem;
         pQ->readers |= pCur->bit;
         pCur->pWaiters = &pQ->readers;
-        ok = !rtos_kernel_blockCurrent(timeout);
+        ok = !rtos_kernel_blockOn(RTOS_WAIT_QUEUE_RECV, pQ, timeout);
     }
     rtos_kernel_schedule();
     rtos_port_exitCritical(cs);
@@ -168,6 +177,7 @@ void rtos_mboxInit(rtos_mbox_t *pMb, uint8_t *storage, uint8_t itemSize)
     pMb->itemSize = itemSize;
     pMb->full = 0;
     pMb->readers = 0;
+    pMb->overwrites = 0;
 }
 
 
@@ -183,6 +193,8 @@ bool rtos_mboxPostFromIsr(rtos_mbox_t *pMb, const void *pItem)
     else
     {
         overwritten = pMb->full != 0;
+        if(overwritten  &&  pMb->overwrites < 0xFFFFu)
+            ++ pMb->overwrites;
         memcpy(pMb->buf, pItem, pMb->itemSize);
         pMb->full = 1;
     }
@@ -224,7 +236,7 @@ bool rtos_mboxFetch(rtos_mbox_t *pMb, void *pItem, rtos_tick_t timeout)
         pCur->pXfer = pItem;
         pMb->readers |= pCur->bit;
         pCur->pWaiters = &pMb->readers;
-        ok = !rtos_kernel_blockCurrent(timeout);
+        ok = !rtos_kernel_blockOn(RTOS_WAIT_MBOX, pMb, timeout);
     }
     rtos_port_exitCritical(cs);
     return ok;

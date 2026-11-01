@@ -8,29 +8,41 @@
  */
 
 #include <stdint.h>
+#include <stddef.h>
 #include "rtos_config.h"
 #include "rtos_types.h"
 
 #define RTOS_PORT_MIN_STACK     1u
+/* The host port runs tasks on its own malloc'd stacks and ignores the area given to
+   rtos_createTask, so the tests may pass 1 byte arrays. */
+#define RTOS_PORT_STACK_ALIGN   1u
 #define RTOS_PORT_WEAK          __attribute__((weak))
+#define RTOS_PORT_NOINIT
 #define RTOS_PORT_STR(s)        (s)
-#define RTOS_PORT_RUNTIME_UNIT_US   (1000000ul / RTOS_CFG_TICK_HZ)
+#define RTOS_PORT_RUNTIME_HZ    RTOS_CFG_TICK_HZ
 
 /** Define an interrupt body on the host; it is just a function the test can simulate. */
-#define RTOS_ISR(vector)        void vector##_rtosBody(void)
+#define RTOS_ISR(vector)        RTOS_ISR_(vector)
+#define RTOS_ISR_(vector)       void vector##_rtosBody(void)
 
 typedef void *rtos_port_ctx_t;
 typedef int rtos_port_cs_t;
+typedef uint32_t rtos_port_runtime_t;
 
 rtos_port_cs_t rtos_port_enterCritical(void);
 void rtos_port_exitCritical(rtos_port_cs_t s);
 void rtos_port_enableInterrupts(void);
 void rtos_port_idleSleep(void);
-void rtos_port_halt(void);
+void rtos_port_idleSleepTicks(rtos_tick_t ticks);
+void rtos_port_halt(void) __attribute__((noreturn));
 void rtos_port_switchContext(void);
-rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, uint16_t stackSize, void (*entry)(void));
+rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, size_t stackSize, void (*entry)(void));
 void rtos_port_startTimer(void);
-uint32_t rtos_port_getRunTimeCounter(void);
+rtos_port_runtime_t rtos_port_getRunTimeCounter(void);
+void rtos_port_reset(void) __attribute__((noreturn));
+uint8_t rtos_port_getResetCause(void);
+void rtos_port_wdtStart(uint32_t timeoutMs);
+void rtos_port_wdtKick(void);
 
 /* Host specific test support. */
 

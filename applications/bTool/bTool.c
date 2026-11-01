@@ -271,7 +271,7 @@ static void printStatus(void)
     {
         if(i > 0)
             uart_putc('/');
-        uart_putU32(rtos_getTaskRunTime(i) / (1000ul / RTOS_RUNTIME_UNIT_US));
+        uart_putU32(RTOS_RUNTIME_TO_MS(rtos_getTaskRunTime(i)));
     }
     uart_putsP(PSTR("ms stack="));
     for(i=1; i<RTOS_NUM_TASKS; ++i)

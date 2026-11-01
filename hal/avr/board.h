@@ -81,4 +81,21 @@ static inline void board_timer2StartCtc(uint8_t top)
     TCCR2B = _BV(CS22) | _BV(CS20);
 }
 
+/* Application timer with the same names on every architecture: timer 2 here. */
+#define BOARD_APP_TIMER_VECT            TIMER2_COMPA_vect
+#define BOARD_APP_TIMER_HZ_IS_EXACT(hz) BOARD_TIMER2_HZ_IS_EXACT(hz)
+
+static inline void board_appTimerStart(uint32_t hz)
+{
+    board_timer2StartCtc((uint8_t)BOARD_TIMER2_TOP(hz));
+}
+
+/** Counts of the application timer since its last interrupt, for latency measurements;
+    BOARD_APP_TIMER_COUNT_HZ counts per second. */
+#define BOARD_APP_TIMER_COUNT_HZ    (F_CPU / BOARD_TIMER2_PRESCALER)
+static inline uint32_t board_appTimerElapsed(void)
+{
+    return TCNT2;
+}
+
 #endif  /* BOARD_INCLUDED */

@@ -36,6 +36,33 @@
 #ifndef RTOS_CFG_RUNTIME_STATS
 # define RTOS_CFG_RUNTIME_STATS 1
 #endif
+#ifndef RTOS_CFG_PANIC_ACTION
+# define RTOS_CFG_PANIC_ACTION 0            /* 0 = halt, 1 = reset */
+#endif
+#ifndef RTOS_CFG_WATCHDOG
+# define RTOS_CFG_WATCHDOG 0
+#endif
+#ifndef RTOS_CFG_TRACE
+# define RTOS_CFG_TRACE 0
+#endif
+#ifndef RTOS_CFG_TIMER_TASK_PRIO
+# define RTOS_CFG_TIMER_TASK_PRIO 0         /* 0 = timer callbacks run in the tick ISR */
+#endif
+#ifndef RTOS_CFG_TIMER_TASK_STACK
+# define RTOS_CFG_TIMER_TASK_STACK (4u * RTOS_PORT_MIN_STACK)
+#endif
+#ifndef RTOS_CFG_HEAP
+# define RTOS_CFG_HEAP 0
+#endif
+#ifndef RTOS_CFG_EVGROUPS
+# define RTOS_CFG_EVGROUPS 1
+#endif
+#ifndef RTOS_CFG_SUSPEND
+# define RTOS_CFG_SUSPEND 1
+#endif
+#ifndef RTOS_CFG_TICKLESS
+# define RTOS_CFG_TICKLESS 0
+#endif
 
 /** Bitmask with one bit per task. Sized to the smallest integer that fits. */
 #if RTOS_CFG_NUM_TASKS + 1 <= 8

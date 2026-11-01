@@ -74,7 +74,7 @@ bool rtos_notifyWait(uint16_t *pValue, rtos_tick_t timeout)
     if((pCur->flags & RTOS_TF_NOTIFY_PENDING) == 0  &&  timeout != RTOS_NO_WAIT)
     {
         pCur->flags = (uint8_t)((pCur->flags & ~RTOS_TF_NOTIFY_TAKE) | RTOS_TF_WAIT_NOTIFY);
-        (void)rtos_kernel_blockCurrent(timeout);
+        (void)rtos_kernel_blockOn(RTOS_WAIT_NOTIFY, NULL, timeout);
         pCur->flags &= (uint8_t)~RTOS_TF_WAIT_NOTIFY;
     }
     ok = (pCur->flags & RTOS_TF_NOTIFY_PENDING) != 0;
@@ -99,7 +99,7 @@ bool rtos_notifyTake(rtos_tick_t timeout)
     if(pCur->notifyValue == 0  &&  timeout != RTOS_NO_WAIT)
     {
         pCur->flags |= RTOS_TF_WAIT_NOTIFY | RTOS_TF_NOTIFY_TAKE;
-        (void)rtos_kernel_blockCurrent(timeout);
+        (void)rtos_kernel_blockOn(RTOS_WAIT_NOTIFY, NULL, timeout);
         pCur->flags &= (uint8_t)~(RTOS_TF_WAIT_NOTIFY | RTOS_TF_NOTIFY_TAKE);
     }
     ok = pCur->notifyValue != 0;

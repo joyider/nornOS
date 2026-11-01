@@ -16,10 +16,12 @@
  *   t=1000 us=1000123 periodic=100 isr=500 semTimeouts=0 idle=... ovr=0 stack=...
  */
 
-#include <avr/io.h>
 #include "rtos.h"
 #include "uart.h"
 #include "board.h"
+#include "testresult.h"
+
+static const gpio_pin_t _pinLed = BOARD_PIN_LED;
 
 
 /*
@@ -34,7 +36,7 @@
 
 #define PERIOD_MS           10u
 #define APPL_IRQ_HZ         500ul
-#if !BOARD_TIMER2_HZ_IS_EXACT(APPL_IRQ_HZ)
+#if !BOARD_APP_TIMER_HZ_IS_EXACT(APPL_IRQ_HZ)
 # error APPL_IRQ_HZ is not an exact rate of timer 2
 #endif
 
@@ -44,7 +46,11 @@
 # define TC01_STOP_AFTER_MS  3000ul
 #endif
 
-#define STACK_SIZE          192u
+#if RTOS_PORT_MIN_STACK > 192u
+# define STACK_SIZE          (2u * RTOS_PORT_MIN_STACK)
+#else
+# define STACK_SIZE          192u
+#endif
 
 
 /*
@@ -73,7 +79,7 @@ static volatile uint32_t _idleLoops = 0;
  */
 
 /** Application interrupt: timer 2 compare A at APPL_IRQ_HZ. */
-RTOS_ISR(TIMER2_COMPA_vect)
+RTOS_ISR(BOARD_APP_TIMER_VECT)
 {
     rtos_semGiveFromIsr(&_semIsr);
 }
@@ -81,7 +87,7 @@ RTOS_ISR(TIMER2_COMPA_vect)
 
 static void startApplInterrupt(void)
 {
-    board_timer2StartCtc((uint8_t)BOARD_TIMER2_TOP(APPL_IRQ_HZ));
+    board_appTimerStart(APPL_IRQ_HZ);
 }
 
 
@@ -96,12 +102,12 @@ static void taskPeriodic(void *arg)
     uint16_t n = 0;
     (void)arg;
 
-    DDRB |= _BV(PB7);
+    gpio_output(&_pinLed);
     for(;;)
     {
         (void)rtos_waitPeriodic(RTOS_MS(PERIOD_MS));
 
-        PINB = _BV(PB7);        /* Toggle LED. */
+        gpio_toggle(&_pinLed);
 
         rtos_mutexLock(&_mutexShared);
         ++ _shared.periodicCount;
@@ -159,6 +165,28 @@ static void printStatus(void)
 }
 
 
+/** Expected after TC01_STOP_AFTER_MS: 100 periodic wakes and 500 ISR events per second,
+    no semaphore timeouts, no overruns, time base within 0.5 percent, stacks intact. */
+static void finish(void)
+{
+    const uint32_t ms = TC01_STOP_AFTER_MS;
+    const uint32_t us = rtos_getTimeUs();
+
+    rtos_mutexLock(&_mutexShared);
+    tc_expectNear("periodic", _shared.periodicCount, ms / PERIOD_MS);
+    tc_expectNear("isr", _shared.isrCount, ms * APPL_IRQ_HZ / 1000);
+    tc_expectRange("semTimeouts", _shared.semTimeouts, 0, 0);
+    rtos_mutexUnlock(&_mutexShared);
+    tc_expectNear("us", us, ms * 1000);
+    tc_expectRange("overruns", rtos_getOverrunCount(TASK_PERIODIC, false), 0, 0);
+    tc_expectRange("idleLoops", _idleLoops, 1, 0xFFFFFFFFul);
+    tc_expectRange("stackFree1", rtos_getStackFree(TASK_ISR_CONSUMER), 32, STACK_SIZE);
+    tc_expectRange("stackFree2", rtos_getStackFree(TASK_WORKER), 32, STACK_SIZE);
+    tc_expectRange("stackFree3", rtos_getStackFree(TASK_PERIODIC), 32, STACK_SIZE);
+    tc_finish("tc01");
+}
+
+
 static void taskWorker(void *arg)
 {
     (void)arg;
@@ -173,10 +201,7 @@ static void taskWorker(void *arg)
 
 #if TC01_STOP_AFTER_MS > 0
         if(rtos_getTick() >= RTOS_MS(TC01_STOP_AFTER_MS))
-        {
-            uart_putsP(PSTR("tc01: done\r\n"));
-            rtos_port_halt();
-        }
+            finish();
 #endif
     }
 }
@@ -185,7 +210,7 @@ static void taskWorker(void *arg)
 /** Report assertion failures over the UART before halting. */
 void rtos_assertFailed(const char *file, uint16_t line)
 {
-    cli();
+    (void)rtos_port_enterCritical();
     uart_putsP(PSTR("\r\nASSERTION FAILED: "));
     uart_putsP(file);
     uart_putsP(PSTR(", line "));

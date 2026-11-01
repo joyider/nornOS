@@ -24,6 +24,8 @@ static inline void *take(rtos_pool_t *pPool)
     {
         pPool->pFree = *(void **)pBlock;
         -- pPool->numFree;
+        if(pPool->numFree < pPool->minFree)
+            pPool->minFree = pPool->numFree;
     }
     return pBlock;
 }
@@ -51,6 +53,8 @@ void rtos_poolInit(rtos_pool_t *pPool, uint8_t *storage, uint16_t blockSize, uin
         p += blockSize;
     }
     *(void **)p = NULL;
+    pPool->minFree = numBlocks;
+    pPool->failed = 0;
 }
 
 
@@ -68,9 +72,11 @@ void *rtos_poolAlloc(rtos_pool_t *pPool, rtos_tick_t timeout)
         pCur->pXfer = &pBlock;
         pPool->waiters |= pCur->bit;
         pCur->pWaiters = &pPool->waiters;
-        if(rtos_kernel_blockCurrent(timeout))
+        if(rtos_kernel_blockOn(RTOS_WAIT_POOL, pPool, timeout))
             pBlock = NULL;
     }
+    if(pBlock == NULL  &&  pPool->failed < 0xFFFFu)
+        ++ pPool->failed;
     rtos_port_exitCritical(cs);
     return pBlock;
 }

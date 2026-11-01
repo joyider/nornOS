@@ -13,17 +13,19 @@
  * two bursts per second.
  */
 
-#include <avr/io.h>
 #include "rtos.h"
 #include "uart.h"
 #include "board.h"
+#include "testresult.h"
+
+static const gpio_pin_t _pinLed = BOARD_PIN_LED;
 
 #define TASK_LED        1u
 #define TASK_COUNTER    2u
 #define TASK_REPORTER   3u
 
 #define APPL_IRQ_HZ     500ul
-#if !BOARD_TIMER2_HZ_IS_EXACT(APPL_IRQ_HZ)
+#if !BOARD_APP_TIMER_HZ_IS_EXACT(APPL_IRQ_HZ)
 # error APPL_IRQ_HZ is not an exact rate of timer 2
 #endif
 
@@ -31,7 +33,11 @@
 # define TC03_STOP_AFTER_MS  3000ul
 #endif
 
-#define STACK_SIZE      192u
+#if RTOS_PORT_MIN_STACK > 192u
+# define STACK_SIZE      (2u * RTOS_PORT_MIN_STACK)
+#else
+# define STACK_SIZE      192u
+#endif
 
 static uint8_t _stackLed[STACK_SIZE];
 static uint8_t _stackCounter[STACK_SIZE];
@@ -45,7 +51,7 @@ static volatile uint16_t _isrNotifies = 0;
 static volatile uint16_t _bursts = 0;
 
 
-RTOS_ISR(TIMER2_COMPA_vect)
+RTOS_ISR(BOARD_APP_TIMER_VECT)
 {
     rtos_notifyFromIsr(TASK_COUNTER, 0, RTOS_NOTIFY_INC);
 }
@@ -53,7 +59,7 @@ RTOS_ISR(TIMER2_COMPA_vect)
 
 static void startApplInterrupt(void)
 {
-    board_timer2StartCtc((uint8_t)BOARD_TIMER2_TOP(APPL_IRQ_HZ));
+    board_appTimerStart(APPL_IRQ_HZ);
 }
 
 
@@ -83,12 +89,12 @@ static void cbBurst(void *arg)
 static void taskLed(void *arg)
 {
     (void)arg;
-    DDRB |= _BV(PB7);
+    gpio_output(&_pinLed);
     for(;;)
     {
         if(rtos_notifyTake(RTOS_MS(1000)))
         {
-            PINB = _BV(PB7);
+            gpio_toggle(&_pinLed);
             ++ _blinks;
         }
         else
@@ -107,6 +113,25 @@ static void taskCounter(void *arg)
         else
             uart_putsP(PSTR("counter: timeout, ISR not running!\r\n"));
     }
+}
+
+
+/** Expected after TC03_STOP_AFTER_MS: the blink timer fired 4 times a second (the first
+    one is at 250 ms), the ISR notified 500 times a second, the burst timer restarted
+    itself 4 times a second and both burst flags were seen in the last second. */
+static void finish(uint16_t flags)
+{
+    const uint32_t ms = TC03_STOP_AFTER_MS;
+
+    tc_expectRange("blinks", _blinks, ms / 250 - 2, ms / 250);
+    tc_expectNear("isrNotifies", _isrNotifies, ms * APPL_IRQ_HZ / 1000);
+    tc_expectRange("bursts", _bursts, ms / 250 - 1, ms / 250 + 1);
+    tc_expectRange("burstFlags", flags, 0x03, 0x03);
+    tc_expect("blink timer active", rtos_timerIsActive(&_tmrBlink));
+    tc_expectRange("stackFree1", rtos_getStackFree(TASK_LED), 32, STACK_SIZE);
+    tc_expectRange("stackFree2", rtos_getStackFree(TASK_COUNTER), 32, STACK_SIZE);
+    tc_expectRange("stackFree3", rtos_getStackFree(TASK_REPORTER), 32, STACK_SIZE);
+    tc_finish("tc03");
 }
 
 
@@ -133,10 +158,7 @@ static void taskReporter(void *arg)
 
 #if TC03_STOP_AFTER_MS > 0
         if(rtos_getTick() >= RTOS_MS(TC03_STOP_AFTER_MS))
-        {
-            uart_putsP(PSTR("tc03: done\r\n"));
-            rtos_port_halt();
-        }
+            finish(flags);
 #endif
     }
 }
@@ -144,7 +166,7 @@ static void taskReporter(void *arg)
 
 void rtos_assertFailed(const char *file, uint16_t line)
 {
-    cli();
+    (void)rtos_port_enterCritical();
     uart_putsP(PSTR("\r\nASSERTION FAILED: "));
     uart_putsP(file);
     uart_putsP(PSTR(", line "));

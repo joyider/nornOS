@@ -8,7 +8,6 @@
  */
 
 #include <stdint.h>
-#include <avr/pgmspace.h>
 #include "gpio.h"
 
 typedef struct hd44780

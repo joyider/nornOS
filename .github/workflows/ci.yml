@@ -1,0 +1,36 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  host-and-avr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install AVR toolchain and simavr
+        run: sudo apt-get update && sudo apt-get install -y gcc-avr avr-libc simavr python3-serial
+      - name: Host unit tests (ASan, UBSan)
+        run: make host-test
+      - name: AVR boards in simavr
+        run: ESP_PORT= QEMU_ESP=/nonexistent ESP_PYTHON=python3 tools/test_all.sh
+
+  esp32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache toolchains
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/dev/tools
+          key: esp-tools-xtensa-16.1.0-qemu-9.2.2
+      - name: Install Xtensa toolchain, QEMU and esptool
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/dev/tools && cd ~/dev/tools
+          curl -sSL -o x.tar.xz https://github.com/espressif/crosstool-NG/releases/download/esp-16.1.0_20260609/xtensa-esp-elf-16.1.0_20260609-x86_64-linux-gnu.tar.xz
+          mkdir xtensa-esp-elf-16.1.0 && tar -xJf x.tar.xz -C xtensa-esp-elf-16.1.0 --strip-components=1 && rm x.tar.xz
+          curl -sSL -o q.tar.xz https://github.com/espressif/qemu/releases/download/esp-develop-9.2.2-20260417/qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz
+          mkdir qemu-esp && tar -xJf q.tar.xz -C qemu-esp --strip-components=1 && rm q.tar.xz
+          python3 -m venv esp-venv && esp-venv/bin/pip install -q esptool
+      - name: ESP32 tests in QEMU
+        run: ESP_PORT= AVR_BOARDS= tools/test_all.sh

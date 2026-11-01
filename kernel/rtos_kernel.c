@@ -27,7 +27,7 @@
  */
 
 /** Byte pattern written into unused stack space for rtos_getStackFree. */
-#define STACK_FILL_PATTERN      0xA5u
+#define STACK_FILL_PATTERN      RTOS_STACK_FILL
 
 
 /*
@@ -65,10 +65,10 @@ volatile rtos_tick_t rtos_tickCount = 0;
 
 #if RTOS_CFG_RUNTIME_STATS
 /** Run time counter value at the last context switch. */
-static uint32_t _lastSwitchTime = 0;
+static rtos_runtime_t _lastSwitchTime = 0;
 /** Reference values of the previous rtos_getCpuLoad call. */
-static uint32_t _loadRefTime = 0;
-static uint32_t _loadRefIdle = 0;
+static rtos_runtime_t _loadRefTime = 0;
+static rtos_runtime_t _loadRefIdle = 0;
 #endif
 
 /** Index of the highest set bit of a nibble; 0 for 0. */
@@ -88,11 +88,14 @@ static inline uint8_t highestBit8(uint8_t b)
 
 /**
  * Index of the highest set bit of a task mask. Must not be called with 0 (never happens,
- * the idle bit is always set).
+ * the idle bit is always set). A port with a count-leading-zeros instruction defines
+ * RTOS_PORT_HIGHEST_BIT(m) and the nibble table is not used.
  */
 static inline uint8_t highestBit(rtos_taskmask_t m)
 {
-#if RTOS_CFG_NUM_TASKS + 1 > 16
+#if defined(RTOS_PORT_HIGHEST_BIT)
+    return (uint8_t)RTOS_PORT_HIGHEST_BIT(m);
+#elif RTOS_CFG_NUM_TASKS + 1 > 16
     if(m & 0xFF000000ul)
         return (uint8_t)(24u + highestBit8((uint8_t)(m >> 24)));
     if(m & 0x00FF0000ul)
@@ -116,9 +119,29 @@ static inline uint8_t highestBit(rtos_taskmask_t m)
 static inline void accountRunTime(void)
 {
 #if RTOS_CFG_RUNTIME_STATS
-    const uint32_t now = rtos_port_getRunTimeCounter();
+    const rtos_runtime_t now = rtos_port_getRunTimeCounter();
     rtos_pCurrent->runTime += now - _lastSwitchTime;
     _lastSwitchTime = now;
+#endif
+}
+
+
+/**
+ * Stack bottom canary: the first bytes of a task's stack must still hold the fill
+ * pattern. Checked for the running task before every switch and at every tick, so an
+ * overflow is caught within a tick of happening instead of when the corruption bites.
+ */
+static inline void checkStack(const rtos_tcb_t *pT)
+{
+#if RTOS_CFG_STACK_CHECK >= 2
+    const uint8_t * const p = pT->pStackArea;
+    if(p != NULL
+       &&  (p[0] != STACK_FILL_PATTERN  ||  p[1] != STACK_FILL_PATTERN
+            ||  p[2] != STACK_FILL_PATTERN  ||  p[3] != STACK_FILL_PATTERN)
+      )
+        rtos_panic(RTOS_PANIC_STACK_OVERFLOW, pT->prio, 0);
+#else
+    (void)pT;
 #endif
 }
 
@@ -128,6 +151,18 @@ static inline void accountRunTime(void)
  * decides when to run the scheduler (immediately in task context, at ISR exit in ISR
  * context).
  */
+rtos_taskmask_t rtos_kernel_getReadyMask(void)
+{
+    return _readyMask;
+}
+
+
+rtos_tcb_t *rtos_kernel_getTimedHead(void)
+{
+    return _pTimedHead;
+}
+
+
 void rtos_kernel_makeReady(rtos_tcb_t *pT)
 {
     if(pT->flags & RTOS_TF_IN_TIMED_LIST)
@@ -137,6 +172,15 @@ void rtos_kernel_makeReady(rtos_tcb_t *pT)
         *pT->pWaiters &= (rtos_taskmask_t)~pT->bit;
         pT->pWaiters = NULL;
     }
+    RTOS_TRACE(RTOS_TRACE_READY, pT->prio, pT->waitKind);
+#if RTOS_CFG_SUSPEND
+    if(pT->flags & RTOS_TF_SUSPENDED)
+    {
+        /* The wake up is consumed but the task stays off the ready mask until resume. */
+        pT->flags |= RTOS_TF_READY_PENDING;
+        return;
+    }
+#endif
     _readyMask |= pT->bit;
     rtos_needSwitch = 1;
 }
@@ -160,6 +204,8 @@ void rtos_kernel_schedule(void)
         rtos_pNext = &rtos_tcbAry[hi];
         if(rtos_pNext != pCur)
         {
+            checkStack(pCur);
+            RTOS_TRACE(RTOS_TRACE_SWITCH, pCur->prio, rtos_pNext->prio);
             accountRunTime();
             rtos_port_switchContext();
         }
@@ -183,12 +229,23 @@ bool rtos_kernel_blockCurrent(rtos_tick_t timeout)
         pCur->wakeAt = rtos_tickCount + timeout;
         insertTimed(pCur);
     }
+    RTOS_TRACE(RTOS_TRACE_BLOCK, pCur->prio, pCur->waitKind);
     _readyMask &= (rtos_taskmask_t)~pCur->bit;
     rtos_kernel_schedule();
 
     /* We are back: someone made us ready. The waiter pointer has been cleared by
        whoever did it. */
+    pCur->waitKind = RTOS_WAIT_NONE;
+    pCur->pWaitObj = NULL;
     return (pCur->flags & RTOS_TF_TIMED_OUT) != 0;
+}
+
+
+bool rtos_kernel_blockOn(uint8_t waitKind, const void *pWaitObj, rtos_tick_t timeout)
+{
+    rtos_pCurrent->waitKind = waitKind;
+    rtos_pCurrent->pWaitObj = pWaitObj;
+    return rtos_kernel_blockCurrent(timeout);
 }
 
 
@@ -234,6 +291,8 @@ void rtos_tickFromIsr(void)
 {
     const rtos_tick_t now = ++rtos_tickCount;
 
+    checkStack(rtos_pCurrent);
+
     while(_pTimedHead != NULL  &&  (rtos_tickdiff_t)(_pTimedHead->wakeAt - now) <= 0)
     {
         rtos_tcb_t * const pT = _pTimedHead;
@@ -264,6 +323,8 @@ void rtos_isrTail(void)
         if(hi > rtos_pCurrent->effPrio)
         {
             rtos_pNext = &rtos_tcbAry[hi];
+            checkStack(rtos_pCurrent);
+            RTOS_TRACE(RTOS_TRACE_SWITCH, rtos_pCurrent->prio, hi);
             accountRunTime();
             rtos_port_switchContext();
         }
@@ -327,7 +388,10 @@ void rtos_init(void)
         pT->effPrio = i;
         pT->flags = 0;
         pT->cntOverrun = 0;
+        pT->waitKind = RTOS_WAIT_NONE;
+        pT->pWaitObj = NULL;
     }
+    rtos_kernel_panicInit();
     _readyMask = rtos_tcbAry[RTOS_IDLE_TASK].bit;
     _pTimedHead = NULL;
     rtos_tickCount = 0;
@@ -341,15 +405,29 @@ void rtos_createTask( uint8_t prio
                     , rtos_taskFunc_t taskFunc
                     , void *arg
                     , uint8_t *stackArea
-                    , uint16_t stackSize
+                    , size_t stackSize
                     )
 {
     rtos_tcb_t *pT;
 
     RTOS_ASSERT(prio >= 1  &&  prio < RTOS_NUM_TASKS);
-    RTOS_ASSERT(taskFunc != NULL  &&  stackArea != NULL  &&  stackSize >= RTOS_PORT_MIN_STACK);
+    RTOS_ASSERT(taskFunc != NULL  &&  stackArea != NULL);
     pT = &rtos_tcbAry[prio];
     RTOS_ASSERT(pT->taskFunc == NULL);
+
+    /* Trim the area to the alignment the port's ABI requires for stack frames. */
+    {
+        const size_t misalign = (size_t)((uintptr_t)stackArea % RTOS_PORT_STACK_ALIGN);
+        if(misalign != 0)
+        {
+            const size_t skip = RTOS_PORT_STACK_ALIGN - misalign;
+            RTOS_ASSERT(stackSize > skip);
+            stackArea += skip;
+            stackSize -= skip;
+        }
+        stackSize -= stackSize % RTOS_PORT_STACK_ALIGN;
+    }
+    RTOS_ASSERT(stackSize >= RTOS_PORT_MIN_STACK);
 
     pT->taskFunc = taskFunc;
     pT->arg = arg;
@@ -358,7 +436,7 @@ void rtos_createTask( uint8_t prio
 
 #if RTOS_CFG_STACK_CHECK
     {
-        uint16_t i;
+        size_t i;
         for(i=0; i<stackSize; ++i)
             stackArea[i] = STACK_FILL_PATTERN;
     }
@@ -370,6 +448,9 @@ void rtos_createTask( uint8_t prio
 
 void rtos_start(void)
 {
+#if RTOS_CFG_TIMER_TASK_PRIO > 0
+    rtos_kernel_timerTaskCreate();
+#endif
     rtos_port_startTimer();
     (void)rtos_port_enterCritical();
 #if RTOS_CFG_RUNTIME_STATS
@@ -386,7 +467,12 @@ void rtos_start(void)
 #ifdef RTOS_CFG_IDLE_HOOK
         RTOS_CFG_IDLE_HOOK();
 #endif
-#if RTOS_CFG_IDLE_SLEEP
+#if RTOS_CFG_WATCHDOG
+        rtos_kernel_wdtIdle();
+#endif
+#if RTOS_CFG_TICKLESS
+        rtos_port_idleSleepTicks(rtos_kernel_ticksToNextWake());
+#elif RTOS_CFG_IDLE_SLEEP
         rtos_port_idleSleep();
 #endif
     }
@@ -411,7 +497,7 @@ void rtos_delay(rtos_tick_t ticks)
        immediately. The delay is guaranteed to be at least \a ticks. */
     if(ticks != RTOS_FOREVER)
         ++ ticks;
-    (void)rtos_kernel_blockCurrent(ticks);
+    (void)rtos_kernel_blockOn(RTOS_WAIT_DELAY, NULL, ticks);
     rtos_port_exitCritical(cs);
 }
 
@@ -436,9 +522,11 @@ bool rtos_waitPeriodic(rtos_tick_t period)
     else
     {
         pCur->wakeAt = pCur->periodBase;
+        pCur->waitKind = RTOS_WAIT_PERIODIC;
         insertTimed(pCur);
         _readyMask &= (rtos_taskmask_t)~pCur->bit;
         rtos_kernel_schedule();
+        pCur->waitKind = RTOS_WAIT_NONE;
     }
     rtos_port_exitCritical(cs);
     return overrun;
@@ -476,7 +564,7 @@ rtos_evt_t rtos_waitEvents(rtos_evt_t mask, uint8_t opt, rtos_tick_t timeout)
     if(got == 0  &&  timeout != RTOS_NO_WAIT)
     {
         pCur->evtWait = mask;
-        (void)rtos_kernel_blockCurrent(timeout);
+        (void)rtos_kernel_blockOn(RTOS_WAIT_EVENTS, NULL, timeout);
         pCur->evtWait = 0;
         got = evtMatch(pCur->evtPending, mask, pCur->flags);
     }
@@ -551,12 +639,12 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset)
 }
 
 
-uint16_t rtos_getStackFree(uint8_t taskId)
+size_t rtos_getStackFree(uint8_t taskId)
 {
 #if RTOS_CFG_STACK_CHECK
     const rtos_tcb_t * const pT = &rtos_tcbAry[taskId];
     const uint8_t *p = pT->pStackArea;
-    uint16_t n = 0;
+    size_t n = 0;
 
     if(p == NULL)
         return 0;
@@ -573,10 +661,133 @@ uint16_t rtos_getStackFree(uint8_t taskId)
 }
 
 
-uint32_t rtos_getTaskRunTime(uint8_t taskId)
+#if RTOS_CFG_SUSPEND
+void rtos_suspend(uint8_t taskId)
+{
+    rtos_tcb_t *pT;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    if((pT->flags & RTOS_TF_SUSPENDED) == 0)
+    {
+        pT->flags |= RTOS_TF_SUSPENDED;
+        if(_readyMask & pT->bit)
+        {
+            /* Was runnable: remember that, so resume makes it runnable again. */
+            _readyMask &= (rtos_taskmask_t)~pT->bit;
+            pT->flags |= RTOS_TF_READY_PENDING;
+        }
+        if(pT == rtos_pCurrent)
+            rtos_kernel_schedule();
+    }
+    rtos_port_exitCritical(cs);
+}
+
+
+void rtos_resume(uint8_t taskId)
+{
+    rtos_tcb_t *pT;
+    const rtos_port_cs_t cs = rtos_port_enterCritical();
+
+    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    pT = &rtos_tcbAry[taskId];
+    if(pT->flags & RTOS_TF_SUSPENDED)
+    {
+        pT->flags &= (uint8_t)~RTOS_TF_SUSPENDED;
+        if(pT->flags & RTOS_TF_READY_PENDING)
+        {
+            pT->flags &= (uint8_t)~RTOS_TF_READY_PENDING;
+            _readyMask |= pT->bit;
+            rtos_needSwitch = 1;
+            rtos_kernel_schedule();
+        }
+    }
+    rtos_port_exitCritical(cs);
+}
+
+
+void rtos_resumeFromIsr(uint8_t taskId)
+{
+    rtos_tcb_t * const pT = &rtos_tcbAry[taskId];
+
+    RTOS_ASSERT(taskId >= 1  &&  taskId < RTOS_NUM_TASKS);
+    if((pT->flags & RTOS_TF_SUSPENDED) != 0)
+    {
+        pT->flags &= (uint8_t)~RTOS_TF_SUSPENDED;
+        if(pT->flags & RTOS_TF_READY_PENDING)
+        {
+            pT->flags &= (uint8_t)~RTOS_TF_READY_PENDING;
+            _readyMask |= pT->bit;
+            rtos_needSwitch = 1;        /* the ISR tail switches */
+        }
+    }
+}
+#endif
+
+
+rtos_tick_t rtos_kernel_ticksToNextWake(void)
+{
+    rtos_tick_t next = RTOS_FOREVER;
+    if(_pTimedHead != NULL)
+    {
+        const rtos_tickdiff_t d = (rtos_tickdiff_t)(_pTimedHead->wakeAt - rtos_tickCount);
+        next = d <= 0 ? 0u : (rtos_tick_t)d;
+    }
+#if RTOS_CFG_SW_TIMERS
+    {
+        const rtos_tick_t t = rtos_kernel_timerTicksToNext();
+        if(t < next)
+            next = t;
+    }
+#endif
+    return next;
+}
+
+
+bool rtos_getTaskInfo(uint8_t taskId, rtos_taskInfo_t *pInfo)
+{
+    const rtos_tcb_t *pT;
+    rtos_port_cs_t cs;
+
+    if(taskId >= RTOS_NUM_TASKS  ||  pInfo == NULL)
+        return false;
+    pT = &rtos_tcbAry[taskId];
+    cs = rtos_port_enterCritical();
+    if(taskId != RTOS_IDLE_TASK  &&  pT->taskFunc == NULL)
+        pInfo->state = RTOS_TASK_NONE;
+    else if(pT->flags & RTOS_TF_SUSPENDED)
+        pInfo->state = RTOS_TASK_SUSPENDED;
+    else if(pT == rtos_pCurrent)
+        pInfo->state = RTOS_TASK_RUNNING;
+    else if(_readyMask & pT->bit)
+        pInfo->state = RTOS_TASK_READY;
+    else
+        pInfo->state = RTOS_TASK_BLOCKED;
+    pInfo->prio = pT->prio;
+    pInfo->effPrio = pT->effPrio;
+    pInfo->waitKind = pInfo->state >= RTOS_TASK_BLOCKED ? pT->waitKind : RTOS_WAIT_NONE;
+    pInfo->pWaitObj = pInfo->state >= RTOS_TASK_BLOCKED ? pT->pWaitObj : NULL;
+    pInfo->hasTimeout = (pT->flags & RTOS_TF_IN_TIMED_LIST) != 0;
+    pInfo->wakeAt = pT->wakeAt;
+    pInfo->stackSize = pT->stackSize;
+    pInfo->overruns = pT->cntOverrun;
+#if RTOS_CFG_RUNTIME_STATS
+    accountRunTime();
+    pInfo->runTime = pT->runTime;
+#else
+    pInfo->runTime = 0;
+#endif
+    rtos_port_exitCritical(cs);
+    pInfo->stackFree = rtos_getStackFree(taskId);
+    return true;
+}
+
+
+rtos_runtime_t rtos_getTaskRunTime(uint8_t taskId)
 {
 #if RTOS_CFG_RUNTIME_STATS
-    uint32_t t;
+    rtos_runtime_t t;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
     accountRunTime();
@@ -593,7 +804,7 @@ uint32_t rtos_getTaskRunTime(uint8_t taskId)
 uint8_t rtos_getCpuLoad(void)
 {
 #if RTOS_CFG_RUNTIME_STATS
-    uint32_t total, idle;
+    rtos_runtime_t total, idle;
     uint8_t load;
     const rtos_port_cs_t cs = rtos_port_enterCritical();
 
@@ -615,13 +826,3 @@ uint8_t rtos_getCpuLoad(void)
 }
 
 
-/**
- * Weak default assertion handler: halt with interrupts disabled. The application may
- * define its own rtos_assertFailed to report the location first.
- */
-RTOS_PORT_WEAK void rtos_assertFailed(const char *file, uint16_t line)
-{
-    (void)file;
-    (void)line;
-    rtos_port_halt();
-}

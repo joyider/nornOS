@@ -10,6 +10,7 @@
  * OCRnA = 249 and a counter resolution of 4 us.
  */
 
+#include <avr/wdt.h>
 #include "rtos.h"
 #include "rtos_kernel.h"
 
@@ -65,6 +66,102 @@
 
 
 /*
+ * Reset handling
+ */
+
+/** MCUSR as found at startup, before it is cleared. */
+static uint8_t _mcusr __attribute__((section(".noinit")));
+
+/** Set by rtos_port_reset so that the watchdog reset it causes reads as a software reset. */
+static uint8_t _softResetMark __attribute__((section(".noinit")));
+#define SOFT_RESET_MARK     0xC3u
+
+/** Runs before main (and before .data/.bss setup, hence only .noinit data): a watchdog
+    reset leaves the watchdog enabled with the shortest timeout, so it must be disabled at
+    once, and MCUSR must be cleared for the next reset cause to be readable. */
+void rtos_port_init3(void) __attribute__((naked, section(".init3"), used));
+void rtos_port_init3(void)
+{
+    _mcusr = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
+}
+
+
+void rtos_port_reset(void)
+{
+    cli();
+    _softResetMark = SOFT_RESET_MARK;
+#if RTOS_CFG_AVR_RESET_VIA_WDT
+    /* A real reset through the watchdog. Only with a bootloader that disables the
+       watchdog at start (Optiboot, recent Mega bootloaders); the original Mega 2560
+       bootloader keeps resetting until power is cycled. */
+    wdt_enable(WDTO_15MS);
+    for(;;)
+        ;
+#else
+    /* Restart the application image: peripherals keep their state, so every driver
+       must initialize fully, but no bootloader is involved. Interrupt enables of
+       peripherals are cleared here so that nothing fires before main sets them again. */
+    wdt_disable();
+    TIMSK0 = 0; TIMSK1 = 0; TIMSK2 = 0;
+# if defined(TIMSK3)
+    TIMSK3 = 0; TIMSK4 = 0; TIMSK5 = 0;
+# endif
+    __asm__ __volatile__ ("jmp 0");
+    for(;;)
+        ;
+#endif
+}
+
+
+uint8_t rtos_port_getResetCause(void)
+{
+    if(_softResetMark == SOFT_RESET_MARK)
+    {
+        _softResetMark = 0;             /* rtos_port_reset, by watchdog or by jump */
+        return RTOS_RESET_SOFTWARE;
+    }
+    if(_mcusr & _BV(WDRF))
+        return RTOS_RESET_WATCHDOG;
+    if(_mcusr & _BV(BORF))
+        return RTOS_RESET_BROWN_OUT;
+    if(_mcusr & _BV(EXTRF))
+        return RTOS_RESET_EXTERNAL;
+    if(_mcusr & _BV(PORF))
+        return RTOS_RESET_POWER_ON;
+    return RTOS_RESET_UNKNOWN;
+}
+
+
+/*
+ * Watchdog
+ */
+
+void rtos_port_wdtStart(uint32_t timeoutMs)
+{
+    uint8_t wdto;
+    if(timeoutMs <= 15)        wdto = WDTO_15MS;
+    else if(timeoutMs <= 30)   wdto = WDTO_30MS;
+    else if(timeoutMs <= 60)   wdto = WDTO_60MS;
+    else if(timeoutMs <= 120)  wdto = WDTO_120MS;
+    else if(timeoutMs <= 250)  wdto = WDTO_250MS;
+    else if(timeoutMs <= 500)  wdto = WDTO_500MS;
+    else if(timeoutMs <= 1000) wdto = WDTO_1S;
+    else if(timeoutMs <= 2000) wdto = WDTO_2S;
+    else if(timeoutMs <= 4000) wdto = WDTO_4S;
+    else                       wdto = WDTO_8S;
+    wdt_enable(wdto);
+}
+
+
+void rtos_port_wdtKick(void)
+{
+    wdt_reset();
+}
+
+
+/*
  * Function implementation
  */
 
@@ -106,7 +203,7 @@ uint32_t rtos_getTimeUs(void)
 }
 
 
-uint32_t rtos_port_getRunTimeCounter(void)
+rtos_port_runtime_t rtos_port_getRunTimeCounter(void)
 {
     rtos_tick_t t = rtos_tickCount;
     uint16_t cnt = TCNTn;
@@ -121,7 +218,7 @@ uint32_t rtos_port_getRunTimeCounter(void)
 }
 
 
-rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, uint16_t stackSize, void (*entry)(void))
+rtos_port_ctx_t rtos_port_initStack(uint8_t *stackArea, size_t stackSize, void (*entry)(void))
 {
     uint8_t *sp = stackArea + stackSize - 1;
     const uint16_t addr = (uint16_t)entry;   /* avr-gcc function pointers are word addresses */

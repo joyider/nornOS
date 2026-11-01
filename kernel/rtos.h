@@ -55,8 +55,15 @@
 /** rtos_notify operation: increment the current value by one (counting). */
 #define RTOS_NOTIFY_INC         2u
 
-/** Static initializer for a counting semaphore. */
-#define RTOS_SEM_INIT(initialCount)     { (initialCount), 0 }
+/** Static initializer for a counting semaphore without an upper limit. */
+#define RTOS_SEM_INIT(initialCount)     { (initialCount), 0xFFu, 0, 0 }
+
+/** Static initializer for a binary semaphore: a give while the token is available is
+    lost (and counted in the lost field). */
+#define RTOS_SEM_INIT_BINARY(initialCount)  { (initialCount), 1u, 0, 0 }
+
+/** Static initializer for a counting semaphore with an upper limit. */
+#define RTOS_SEM_INIT_MAX(initialCount, maxCount)  { (initialCount), (maxCount), 0, 0 }
 
 /** Static initializer for a ceiling mutex. The ceiling is the highest priority of any task
     that will ever lock the mutex. */
@@ -65,18 +72,23 @@
 /** Static initializer for a queue. \a storage is a uint8_t array of itemSize*capacity
     bytes. Capacity is at most 255. */
 #define RTOS_QUEUE_INIT(storage, itemSize, capacity)                            \
-    { (storage), (itemSize), (capacity), 0, 0, 0, 0, 0 }
+    { (storage), (itemSize), (capacity), 0, 0, 0, 0, 0, 0, 0 }
 
 /** Static initializer for a mailbox. \a storage is a uint8_t array of itemSize bytes. */
-#define RTOS_MBOX_INIT(storage, itemSize)   { (storage), (itemSize), 0, 0 }
+#define RTOS_MBOX_INIT(storage, itemSize)   { (storage), (itemSize), 0, 0, 0 }
 
 /** Static initializer for a memory pool; rtos_poolInit must still be called to build the
     free list. */
 #define RTOS_POOL_INIT(storage, blockSize, numBlocks)                           \
-    { (storage), (blockSize), (numBlocks), 0, 0, NULL }
+    { (storage), (blockSize), (numBlocks), 0, 0, NULL, (numBlocks), 0 }
 
-/** Unit of the run time counters returned by rtos_getTaskRunTime, in microseconds. */
-#define RTOS_RUNTIME_UNIT_US    RTOS_PORT_RUNTIME_UNIT_US
+/** Frequency of the run time counters returned by rtos_getTaskRunTime, in counts per
+    second. RTOS_RUNTIME_TO_MS converts a count to milliseconds. */
+#define RTOS_RUNTIME_HZ         RTOS_PORT_RUNTIME_HZ
+#define RTOS_RUNTIME_TO_MS(t)   ((t) / (RTOS_RUNTIME_HZ / 1000ul))
+
+/** Type of a run time count; width chosen by the port. */
+typedef rtos_port_runtime_t rtos_runtime_t;
 
 /** Convert milliseconds to ticks at compile time. */
 #define RTOS_MS(ms)             ((rtos_tick_t)(((uint32_t)(ms) * RTOS_CFG_TICK_HZ) / 1000ul))
@@ -98,18 +110,23 @@ typedef void (*rtos_timerFunc_t)(void *arg);
 typedef struct rtos_timer
 {
     struct rtos_timer *pNext;   /**< Link in the sorted list of active timers. */
+    struct rtos_timer *pNextPending; /**< Link in the list of expired timers waiting for
+                                     the timer task (RTOS_CFG_TIMER_TASK_PRIO). */
     rtos_tick_t expiresAt;      /**< Absolute tick of the next expiry. */
     rtos_tick_t period;         /**< Reload period, 0 for a one shot timer. */
     rtos_timerFunc_t callback;  /**< Called at expiry. */
     void *arg;                  /**< Passed to the callback. */
     uint8_t active;             /**< 1 while in the list. */
+    uint8_t pending;            /**< 1 while in the pending list. */
 } rtos_timer_t;
 
 /** A counting semaphore. Treat as opaque. */
 typedef struct rtos_sem
 {
     uint8_t count;              /**< Number of free tokens. */
+    uint8_t maxCount;           /**< Upper limit of count; 1 for a binary semaphore. */
     rtos_taskmask_t waiters;    /**< Tasks blocked on this semaphore. */
+    uint8_t lost;               /**< Gives that found the count at the limit (saturates). */
 } rtos_sem_t;
 
 /** A mutex using the immediate priority ceiling protocol. Treat as opaque. */
@@ -133,6 +150,8 @@ typedef struct rtos_queue
     uint8_t tail;               /**< Index where the next item is written. */
     rtos_taskmask_t readers;    /**< Tasks blocked in receive. */
     rtos_taskmask_t writers;    /**< Tasks blocked in send. */
+    uint8_t maxCount;           /**< High water mark of count. */
+    uint16_t dropped;           /**< Sends that failed: full and no wait, or timed out. */
 } rtos_queue_t;
 
 /** A mailbox: one slot holding the most recent item. A post overwrites an unread item.
@@ -143,6 +162,7 @@ typedef struct rtos_mbox
     uint8_t itemSize;           /**< Bytes per item. */
     uint8_t full;               /**< 1 if the slot holds an unread item. */
     rtos_taskmask_t readers;    /**< Tasks blocked in fetch. */
+    uint16_t overwrites;        /**< Posts that replaced an unread item. */
 } rtos_mbox_t;
 
 
@@ -155,7 +175,103 @@ typedef struct rtos_pool
     uint8_t numFree;            /**< Currently free blocks. */
     rtos_taskmask_t waiters;    /**< Tasks blocked in alloc. */
     void *pFree;                /**< Head of the free list. */
+    uint8_t minFree;            /**< Low water mark of numFree. */
+    uint16_t failed;            /**< Allocations that returned NULL. */
 } rtos_pool_t;
+
+/** Why the kernel stopped the system; the first field of rtos_panicInfo_t. */
+typedef enum rtos_panicReason
+{
+    RTOS_PANIC_NONE = 0,
+    RTOS_PANIC_ASSERT,          /**< pFile/line: the failed RTOS_ASSERT. */
+    RTOS_PANIC_STACK_OVERFLOW,  /**< arg1: the task whose stack bottom was overwritten. */
+    RTOS_PANIC_WATCHDOG,        /**< arg1: task that did not check in, RTOS_NO_TASK: idle. */
+    RTOS_PANIC_DEADLOCK,        /**< arg1: task that would block, arg2: task it waits for. */
+    RTOS_PANIC_FAULT,           /**< CPU exception; arg1: cause, arg2: address (port). */
+    RTOS_PANIC_APPLICATION      /**< rtos_panic called by the application; args are its own. */
+} rtos_panicReason_t;
+
+/** What happened; filled in by rtos_panic and kept across a reset. */
+typedef struct rtos_panicInfo
+{
+    uint8_t reason;             /**< rtos_panicReason_t. */
+    uint8_t task;               /**< Task that was running. */
+    uint16_t line;              /**< Source line of a failed assertion. */
+    uint32_t arg1;
+    uint32_t arg2;
+    rtos_tick_t tick;           /**< Time of the panic. */
+    const char *pFile;          /**< Source file of a failed assertion; only meaningful in
+                                     the same firmware image. */
+} rtos_panicInfo_t;
+
+/** Cause of the last reset as the hardware reports it. */
+#define RTOS_RESET_UNKNOWN      0u
+#define RTOS_RESET_POWER_ON     1u
+#define RTOS_RESET_EXTERNAL     2u
+#define RTOS_RESET_BROWN_OUT    3u
+#define RTOS_RESET_WATCHDOG     4u
+#define RTOS_RESET_SOFTWARE     5u
+
+/** What a task is blocked on, in rtos_taskInfo_t. */
+#define RTOS_WAIT_NONE          0u
+#define RTOS_WAIT_DELAY         1u
+#define RTOS_WAIT_PERIODIC      2u
+#define RTOS_WAIT_EVENTS        3u
+#define RTOS_WAIT_SEM           4u
+#define RTOS_WAIT_MUTEX         5u
+#define RTOS_WAIT_QUEUE_SEND    6u
+#define RTOS_WAIT_QUEUE_RECV    7u
+#define RTOS_WAIT_MBOX          8u
+#define RTOS_WAIT_POOL          9u
+#define RTOS_WAIT_NOTIFY        10u
+#define RTOS_WAIT_EVGROUP       11u
+
+#define RTOS_TASK_NONE          0u  /**< Never created. */
+#define RTOS_TASK_RUNNING       1u
+#define RTOS_TASK_READY         2u
+#define RTOS_TASK_BLOCKED       3u
+#define RTOS_TASK_SUSPENDED     4u  /**< rtos_suspend; waitKind says what it was doing. */
+
+/** rtos_evgroupWait option: clear the bits that satisfied the wait, atomically. */
+#define RTOS_WAIT_CLEAR         0x02u
+
+/** An event group: flags shared by any number of tasks. Treat as opaque. */
+typedef struct rtos_evgroup
+{
+    rtos_evt_t bits;            /**< Current flags. */
+    rtos_taskmask_t waiters;    /**< Tasks blocked in rtos_evgroupWait. */
+} rtos_evgroup_t;
+
+/** Static initializer for an event group. */
+#define RTOS_EVGROUP_INIT(initialBits)  { (initialBits), 0 }
+
+/** Heap statistics, see rtos_heapStats. */
+typedef struct rtos_heapStats
+{
+    size_t total;               /**< Bytes handed to rtos_heapInit. */
+    size_t free;                /**< Bytes in free blocks now. */
+    size_t minFree;             /**< Lowest value of free so far. */
+    size_t largestFree;         /**< Largest single free block now. */
+    uint16_t allocs;            /**< Successful rtos_malloc calls. */
+    uint16_t frees;             /**< rtos_free calls. */
+    uint16_t failed;            /**< rtos_malloc calls that returned NULL. */
+} rtos_heapStats_t;
+
+/** Snapshot of a task for diagnostics, see rtos_getTaskInfo. */
+typedef struct rtos_taskInfo
+{
+    uint8_t state;              /**< RTOS_TASK_*. */
+    uint8_t prio;
+    uint8_t effPrio;            /**< prio, or a mutex ceiling while holding it. */
+    uint8_t waitKind;           /**< RTOS_WAIT_* while blocked. */
+    const void *pWaitObj;       /**< The semaphore, mutex, queue, mailbox or pool. */
+    bool hasTimeout;            /**< wakeAt is valid. */
+    rtos_tick_t wakeAt;         /**< Tick of the timeout. */
+    size_t stackSize;
+    size_t stackFree;
+    rtos_runtime_t runTime;
+    uint8_t overruns;
+} rtos_taskInfo_t;
 
 
 /*
@@ -173,7 +289,7 @@ void rtos_createTask( uint8_t prio
                     , rtos_taskFunc_t taskFunc
                     , void *arg
                     , uint8_t *stackArea
-                    , uint16_t stackSize
+                    , size_t stackSize
                     );
 
 /** Start the tick timer and the scheduler. Never returns; the calling context becomes
@@ -214,7 +330,11 @@ void rtos_broadcastEvents(rtos_evt_t events);
 
 /* --- Counting semaphore ---------------------------------------------------------------- */
 
+/** Initialize at run time, as an alternative to RTOS_SEM_INIT. */
 void rtos_semInit(rtos_sem_t *pSem, uint8_t initialCount);
+
+/** Initialize with an upper limit; maxCount 1 gives a binary semaphore. */
+void rtos_semInitMax(rtos_sem_t *pSem, uint8_t initialCount, uint8_t maxCount);
 
 /** Take one token, blocking up to \a timeout ticks. Returns false on timeout. */
 bool rtos_semTake(rtos_sem_t *pSem, rtos_tick_t timeout);
@@ -327,6 +447,47 @@ void rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock);
 
 uint8_t rtos_poolFreeCount(const rtos_pool_t *pPool);
 
+/* --- Event groups (RTOS_CFG_EVGROUPS) ---------------------------------------------- */
+
+void rtos_evgroupInit(rtos_evgroup_t *pG, rtos_evt_t initialBits);
+
+/** Set bits; every waiter whose condition is now met is woken, highest priority first.
+    A waiter with RTOS_WAIT_CLEAR takes its bits out of the group as it is woken. */
+void rtos_evgroupSet(rtos_evgroup_t *pG, rtos_evt_t bits);
+void rtos_evgroupSetFromIsr(rtos_evgroup_t *pG, rtos_evt_t bits);
+
+/** Clear bits; nobody is woken. */
+void rtos_evgroupClear(rtos_evgroup_t *pG, rtos_evt_t bits);
+
+rtos_evt_t rtos_evgroupGet(const rtos_evgroup_t *pG);
+
+/** Wait for any (RTOS_WAIT_ANY) or all (RTOS_WAIT_ALL) bits of \a mask, optionally
+    clearing them on success (| RTOS_WAIT_CLEAR). Returns the bits that satisfied the
+    wait, 0 on timeout. */
+rtos_evt_t rtos_evgroupWait(rtos_evgroup_t *pG, rtos_evt_t mask, uint8_t options, rtos_tick_t timeout);
+
+/* --- Suspend and resume (RTOS_CFG_SUSPEND) ------------------------------------------ */
+
+/** Keep a task from running until rtos_resume. A blocked task stays in its wait; a wake
+    up that arrives meanwhile is kept and takes effect at resume. A task may suspend
+    itself. Not the idle task. */
+void rtos_suspend(uint8_t taskId);
+
+/** Let a suspended task run again (if it is not still blocked). */
+void rtos_resume(uint8_t taskId);
+void rtos_resumeFromIsr(uint8_t taskId);
+
+/* --- Heap (RTOS_CFG_HEAP) ----------------------------------------------------------- */
+
+/** Give the allocator its memory. Call once before the first rtos_malloc. */
+void rtos_heapInit(void *area, size_t size);
+
+/** First fit allocation with coalescing on free; NULL if nothing fits. Task context. */
+void *rtos_malloc(size_t size);
+void rtos_free(void *p);
+
+void rtos_heapStats(rtos_heapStats_t *pStats);
+
 /* --- Diagnostics -------------------------------------------------------------------- */
 
 /** Id (= priority) of the calling task. */
@@ -337,24 +498,73 @@ uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset);
 
 /** Number of never touched bytes at the bottom of a task's stack. Requires
     RTOS_CFG_STACK_CHECK. Returns 0 for the idle task. */
-uint16_t rtos_getStackFree(uint8_t taskId);
+size_t rtos_getStackFree(uint8_t taskId);
 
 /** Microseconds since start, derived from the tick counter and the timer register. */
 uint32_t rtos_getTimeUs(void);
 
-/** Accumulated run time of a task in units of RTOS_RUNTIME_UNIT_US, measured at every
+/** Accumulated run time of a task in counts of RTOS_RUNTIME_HZ, measured at every
     context switch. Task 0 is the idle task. Requires RTOS_CFG_RUNTIME_STATS. */
-uint32_t rtos_getTaskRunTime(uint8_t taskId);
+rtos_runtime_t rtos_getTaskRunTime(uint8_t taskId);
 
 /** CPU load in percent over the interval since the previous call (since start for the
     first call): the share of time not spent in the idle task. Requires
     RTOS_CFG_RUNTIME_STATS. */
 uint8_t rtos_getCpuLoad(void);
 
+/** Snapshot of a task. Returns false for an id out of range. */
+bool rtos_getTaskInfo(uint8_t taskId, rtos_taskInfo_t *pInfo);
+
+/* --- Panic ----------------------------------------------------------------------------- */
+
+/** Stop the system: record the reason, call rtos_panicHook, then halt or reset according
+    to RTOS_CFG_PANIC_ACTION. Applications use RTOS_PANIC_APPLICATION with their own
+    arguments. May be called from any context. */
+void rtos_panic(uint8_t reason, uint32_t arg1, uint32_t arg2) __attribute__((noreturn));
+
+/** The record a panic left before the last reset, if any. Valid once per boot; copied out
+    of the persistent storage by rtos_init. Returns false if there is none. */
+bool rtos_getLastPanic(rtos_panicInfo_t *pInfo);
+
+/** RTOS_RESET_* cause of the last reset. */
+uint8_t rtos_getResetCause(void);
+
 /* --- Hooks ----------------------------------------------------------------------------- */
 
-/** Called by the kernel when an assertion fails. Weak default halts the CPU. */
+/** Called by the kernel when an assertion fails. The default calls rtos_panic. */
 void rtos_assertFailed(const char *file, uint16_t line);
+
+/** Called by rtos_panic with interrupts disabled before the halt or reset. The weak
+    default does nothing; applications print the information here. Must not block. */
+void rtos_panicHook(const rtos_panicInfo_t *pInfo);
+
+/* --- Watchdog (RTOS_CFG_WATCHDOG) --------------------------------------------------- */
+
+/** Start the hardware watchdog with \a timeoutMs (rounded up to what the hardware
+    offers). The idle task kicks it, but only while every monitored task checks in on
+    time; a starved idle task (runaway task or interrupt storm) therefore resets the
+    system without a panic record, a late task causes RTOS_PANIC_WATCHDOG. */
+void rtos_wdtInit(uint32_t timeoutMs);
+
+/** Require \a task to call rtos_wdtCheckIn at least every \a maxInterval ticks;
+    0 stops monitoring it. The first deadline is maxInterval from now. */
+void rtos_wdtMonitor(uint8_t task, rtos_tick_t maxInterval);
+
+/** The calling task is alive; resets its deadline. */
+void rtos_wdtCheckIn(void);
+
+/* --- Trace (RTOS_CFG_TRACE) --------------------------------------------------------- */
+
+#define RTOS_TRACE_SWITCH   1u  /**< a: task leaving, b: task entering. */
+#define RTOS_TRACE_BLOCK    2u  /**< a: task, b: RTOS_WAIT_* kind. */
+#define RTOS_TRACE_READY    3u  /**< a: task made ready, b: RTOS_WAIT_* it was in. */
+#define RTOS_TRACE_TIMER    4u  /**< a: timer address, b: 0 in ISR context, 1 in task. */
+#define RTOS_TRACE_PANIC    5u  /**< a: reason, b: arg1. */
+
+/** Provided by the application when RTOS_CFG_TRACE is on. Called with interrupts
+    disabled from inside the kernel; must be short and must not call the kernel. See
+    hal/trace.h for a ring buffer recorder. */
+void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b);
 
 /* --- Called from the port layer, not by applications -------------------------------------- */
 

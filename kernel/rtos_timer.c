@@ -5,10 +5,14 @@
  * Periodic timers are re-armed from the previous expiry, not from "now", so they do not
  * drift.
  *
- * The callback runs inside the tick interrupt with interrupts disabled. Keep it short and
- * only use kernel functions ending in FromIsr, or rtos_timerStart/Stop, inside it. The
- * usual pattern is to post an event, give a semaphore or notify a task and let that task
- * do the work.
+ * Where the callback runs depends on RTOS_CFG_TIMER_TASK_PRIO:
+ *   0:  inside the tick interrupt with interrupts disabled. Keep it short and only use
+ *       kernel functions ending in FromIsr, or rtos_timerStart/Stop, inside it.
+ *   >0: in the timer task of that priority, created by rtos_start. The tick only moves
+ *       expired timers to a pending list and notifies the task; callbacks may then use
+ *       the whole API, at the cost of latency equal to the timer task's scheduling
+ *       latency. Periodic timers are re-armed in the tick either way, so they stay
+ *       drift free; a timer that expires again before the task got to it runs once.
  */
 
 #include "rtos.h"
@@ -24,6 +28,13 @@
 
 /** Head of the sorted list of active timers. */
 static rtos_timer_t *_pHead = NULL;
+
+#if RTOS_CFG_TIMER_TASK_PRIO > 0
+/** Expired timers waiting for the timer task, in expiry order. */
+static rtos_timer_t *_pPendingHead = NULL;
+static rtos_timer_t *_pPendingTail = NULL;
+static uint8_t _timerStack[RTOS_CFG_TIMER_TASK_STACK];
+#endif
 
 
 /*
@@ -56,6 +67,65 @@ static void remove(rtos_timer_t *pT)
 }
 
 
+#if RTOS_CFG_TIMER_TASK_PRIO > 0
+/** Remove from the pending list if present. Interrupts disabled. */
+static void removePending(rtos_timer_t *pT)
+{
+    rtos_timer_t **ppLink = &_pPendingHead;
+    rtos_timer_t *pPrev = NULL;
+
+    while(*ppLink != NULL  &&  *ppLink != pT)
+    {
+        pPrev = *ppLink;
+        ppLink = &(*ppLink)->pNextPending;
+    }
+    if(*ppLink == pT)
+    {
+        *ppLink = pT->pNextPending;
+        if(_pPendingTail == pT)
+            _pPendingTail = pPrev;
+    }
+    pT->pending = 0;
+}
+
+
+/** The timer task: runs the callbacks of expired timers with interrupts enabled. */
+static void timerTask(void *arg)
+{
+    (void)arg;
+    for(;;)
+    {
+        rtos_timer_t *pT;
+
+        (void)rtos_notifyTake(RTOS_FOREVER);
+        for(;;)
+        {
+            rtos_port_cs_t cs = rtos_port_enterCritical();
+            pT = _pPendingHead;
+            if(pT != NULL)
+            {
+                _pPendingHead = pT->pNextPending;
+                if(_pPendingHead == NULL)
+                    _pPendingTail = NULL;
+                pT->pending = 0;
+            }
+            rtos_port_exitCritical(cs);
+            if(pT == NULL)
+                break;
+            RTOS_TRACE(RTOS_TRACE_TIMER, (uintptr_t)pT, 1);
+            pT->callback(pT->arg);
+        }
+    }
+}
+
+
+void rtos_kernel_timerTaskCreate(void)
+{
+    rtos_createTask(RTOS_CFG_TIMER_TASK_PRIO, timerTask, NULL, _timerStack, sizeof(_timerStack));
+}
+#endif
+
+
 /*
  * Kernel internal
  */
@@ -78,7 +148,33 @@ void rtos_kernel_timerTick(rtos_tick_t now)
         else
             pT->active = 0;
 
+#if RTOS_CFG_TIMER_TASK_PRIO > 0
+        if(!pT->pending)
+        {
+            pT->pending = 1;
+            pT->pNextPending = NULL;
+            if(_pPendingTail != NULL)
+                _pPendingTail->pNextPending = pT;
+            else
+                _pPendingHead = pT;
+            _pPendingTail = pT;
+        }
+        rtos_notifyFromIsr(RTOS_CFG_TIMER_TASK_PRIO, 1, RTOS_NOTIFY_INC);
+#else
+        RTOS_TRACE(RTOS_TRACE_TIMER, (uintptr_t)pT, 0);
         pT->callback(pT->arg);
+#endif
+    }
+}
+
+
+rtos_tick_t rtos_kernel_timerTicksToNext(void)
+{
+    if(_pHead == NULL)
+        return RTOS_FOREVER;
+    {
+        const rtos_tickdiff_t d = (rtos_tickdiff_t)(_pHead->expiresAt - rtos_tickCount);
+        return d <= 0 ? 0u : (rtos_tick_t)d;
     }
 }
 
@@ -96,6 +192,8 @@ void rtos_timerInit(rtos_timer_t *pT, rtos_timerFunc_t callback, void *arg)
     pT->callback = callback;
     pT->arg = arg;
     pT->active = 0;
+    pT->pending = 0;
+    pT->pNextPending = NULL;
 }
 
 
@@ -119,6 +217,10 @@ void rtos_timerStop(rtos_timer_t *pT)
 
     if(pT->active)
         remove(pT);
+#if RTOS_CFG_TIMER_TASK_PRIO > 0
+    if(pT->pending)
+        removePending(pT);
+#endif
     rtos_port_exitCritical(cs);
 }
 
